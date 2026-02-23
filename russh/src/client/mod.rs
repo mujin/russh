@@ -61,6 +61,7 @@ use crate::channels::{
     Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
 };
 use crate::cipher::{self, OpeningKey, clear};
+use crate::cert::PublicKeyOrCertificate;
 use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
 use crate::keys::PrivateKeyWithHashAlg;
 use crate::msg::{is_kex_msg, validate_server_msg_strict_kex};
@@ -438,6 +439,26 @@ impl<H: Handler> Handle<H> {
             .send(Msg::Authenticate {
                 user,
                 method: auth::Method::OpenSshCertificate { key, cert },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        self.wait_recv_reply().await
+    }
+
+    /// Same as [`Handle::authenticate_openssh_cert`], but allows specifying a hash algorithm for RSA keys in the certificate. 
+    /// This is necessary for authentication to succeed with some old servers that does not support `rsa-sha2-512`.
+    /// Perform public OpenSSH Certificate-based SSH authentication with a specified hash algorithm for RSA keys
+    pub async fn authenticate_openssh_cert_with_hash_alg<U: Into<String>>(
+        &mut self,
+        user: U,
+        key: PrivateKeyWithHashAlg,
+        cert: Certificate,
+    ) -> Result<AuthResult, crate::Error> {
+        let user = user.into();
+        self.sender
+            .send(Msg::Authenticate {
+                user,
+                method: auth::Method::OpenSshCertificateWithHashAlg { key, cert },
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
@@ -1743,7 +1764,7 @@ pub trait Handler: Sized + Send {
     #[allow(unused_variables)]
     fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         async { Ok(false) }
     }
