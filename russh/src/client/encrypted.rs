@@ -1025,7 +1025,7 @@ impl Encrypted {
                     buffer,
                 )?;
 
-                sign_with_hash_alg(&key, buffer)?.encode(&mut *buffer)?;
+                sign_with_hash_alg(key, buffer)?.encode(&mut *buffer)?;
 
                 push_packet!(self.write, {
                     #[allow(clippy::indexing_slicing)] // length checked
