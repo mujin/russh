@@ -14,8 +14,9 @@
 //
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use log::debug;
-use rand::RngCore;
+use rand_core::Rng;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PrivateKey};
 
@@ -24,10 +25,12 @@ use crate::helpers::{AlgorithmExt, NameList};
 use crate::kex::{
     EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT, EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER, KexCause,
 };
+use crate::keys::key::safe_rng;
+use crate::parsing::ensure_end;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server::Config;
 use crate::sshbuffer::PacketWriter;
-use crate::{AlgorithmKind, CryptoVec, Error, cipher, compression, kex, mac, msg};
+use crate::{AlgorithmKind, Error, cipher, compression, kex, mac, msg};
 
 #[cfg(target_arch = "wasm32")]
 /// WASM-only stub
@@ -130,13 +133,12 @@ const CIPHER_ORDER: &[cipher::Name] = &[
     cipher::AES_128_CTR,
 ];
 
-const HMAC_ORDER: &[mac::Name] = &[
+// SHA-1 MAC variants are excluded from defaults.
+const SAFE_HMAC_ORDER: &[mac::Name] = &[
     mac::HMAC_SHA512_ETM,
     mac::HMAC_SHA256_ETM,
     mac::HMAC_SHA512,
     mac::HMAC_SHA256,
-    mac::HMAC_SHA1_ETM,
-    mac::HMAC_SHA1,
 ];
 
 const COMPRESSION_ORDER: &[compression::Name] = &[
@@ -170,7 +172,7 @@ impl Preferred {
             Algorithm::Rsa { hash: None },
         ]),
         cipher: Cow::Borrowed(CIPHER_ORDER),
-        mac: Cow::Borrowed(HMAC_ORDER),
+        mac: Cow::Borrowed(SAFE_HMAC_ORDER),
         compression: Cow::Borrowed(COMPRESSION_ORDER),
     };
 
@@ -178,7 +180,7 @@ impl Preferred {
         kex: Cow::Borrowed(SAFE_KEX_ORDER),
         key: Preferred::DEFAULT.key,
         cipher: Cow::Borrowed(CIPHER_ORDER),
-        mac: Cow::Borrowed(HMAC_ORDER),
+        mac: Cow::Borrowed(SAFE_HMAC_ORDER),
         compression: Cow::Borrowed(COMPRESSION_ORDER),
     };
 }
@@ -187,10 +189,6 @@ impl Default for Preferred {
     fn default() -> Preferred {
         Preferred::DEFAULT
     }
-}
-
-pub(crate) fn parse_kex_algo_list(list: &str) -> Vec<&str> {
-    list.split(',').collect()
 }
 
 fn host_key_algorithm_names(algo: &Algorithm) -> Vec<String> {
@@ -205,11 +203,11 @@ fn host_key_algorithm_names(algo: &Algorithm) -> Vec<String> {
 pub(crate) trait Select {
     fn is_server() -> bool;
 
-    fn select<S: AsRef<str> + Clone>(
-        a: &[S],
-        b: &[&str],
+    fn select<A: AsRef<str> + Clone, B: AsRef<str> + Clone>(
+        a: &[A],
+        b: &[B],
         kind: AlgorithmKind,
-    ) -> Result<(bool, S), Error>;
+    ) -> Result<(bool, A), Error>;
 
     /// `available_host_keys`, if present, is used to limit the host key algorithms to the ones we have keys for.
     fn read_kex(
@@ -224,7 +222,7 @@ pub(crate) trait Select {
 
         // Key exchange
 
-        let kex_string = String::decode(&mut r)?;
+        let kex_list = NameList::decode(&mut r)?;
         // Filter out extension kex names from both lists before selecting
         let _local_kexes_no_ext = pref
             .kex
@@ -232,13 +230,17 @@ pub(crate) trait Select {
             .filter(|k| !KEX_EXTENSION_NAMES.contains(k))
             .cloned()
             .collect::<Vec<_>>();
-        let _remote_kexes_no_ext = parse_kex_algo_list(&kex_string)
-            .into_iter()
+        let _remote_kexes_no_ext = kex_list
+            .iter()
             .filter(|k| {
-                kex::Name::try_from(*k)
+                // Keep unknown algorithm names: they can't be selected, but they must
+                // still count towards the client's *first* choice so that an optimistic
+                // `first_kex_packet_follows` guess for an algorithm we don't implement is
+                // correctly judged as wrong (kex_both_first == false). See issue #733.
+                kex::Name::try_from(k.as_str())
                     .ok()
                     .map(|k| !KEX_EXTENSION_NAMES.contains(&k))
-                    .unwrap_or(false)
+                    .unwrap_or(true)
             })
             .collect::<Vec<_>>();
         let (kex_both_first, kex_algorithm) = Self::select(
@@ -260,7 +262,7 @@ pub(crate) trait Select {
             } else {
                 EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER
             }],
-            &parse_kex_algo_list(&kex_string),
+            &kex_list,
             AlgorithmKind::Kex,
         )
         .is_ok();
@@ -271,18 +273,14 @@ pub(crate) trait Select {
 
         // Host key
 
-        let key_string = String::decode(&mut r)?;
+        let key_list = NameList::decode(&mut r)?;
         let possible_host_key_algos = match available_host_keys {
             Some(available_host_keys) => pref.possible_host_key_algos_for_keys(available_host_keys),
             None => pref.key.iter().map(ToOwned::to_owned).collect::<Vec<_>>(),
         };
 
         let (key_both_first, key_algorithm) = if Self::is_server() {
-            Self::select(
-                &possible_host_key_algos[..],
-                &parse_kex_algo_list(&key_string),
-                AlgorithmKind::Key,
-            )?
+            Self::select(&possible_host_key_algos[..], &key_list, AlgorithmKind::Key)?
         } else {
             // For client-side matching, extend preferred host key names with their
             // OpenSSH certificate variants (e.g. "*-cert-v01@openssh.com").
@@ -293,7 +291,7 @@ pub(crate) trait Select {
 
             let (key_both_first, key_algorithm_name) = Self::select(
                 &possible_host_key_algo_names[..],
-                &parse_kex_algo_list(&key_string),
+                &key_list,
                 AlgorithmKind::Key,
             )?;
 
@@ -308,46 +306,37 @@ pub(crate) trait Select {
 
         // Cipher
 
-        let cipher_string = String::decode(&mut r)?;
-        let (_cipher_both_first, cipher) = Self::select(
-            &pref.cipher,
-            &parse_kex_algo_list(&cipher_string),
-            AlgorithmKind::Cipher,
-        )?;
+        let cipher_list = NameList::decode(&mut r)?;
+        let (_cipher_both_first, cipher) =
+            Self::select(&pref.cipher, &cipher_list, AlgorithmKind::Cipher)?;
         String::decode(&mut r)?; // cipher server-to-client.
 
         // MAC
 
         let need_mac = CIPHERS.get(&cipher).map(|x| x.needs_mac()).unwrap_or(false);
 
-        let client_mac = match Self::select(
-            &pref.mac,
-            &parse_kex_algo_list(&String::decode(&mut r)?),
-            AlgorithmKind::Mac,
-        ) {
-            Ok((_, m)) => m,
-            Err(e) => {
-                if need_mac {
-                    return Err(e);
-                } else {
-                    mac::NONE
+        let client_mac =
+            match Self::select(&pref.mac, &NameList::decode(&mut r)?, AlgorithmKind::Mac) {
+                Ok((_, m)) => m,
+                Err(e) => {
+                    if need_mac {
+                        return Err(e);
+                    } else {
+                        mac::NONE
+                    }
                 }
-            }
-        };
-        let server_mac = match Self::select(
-            &pref.mac,
-            &parse_kex_algo_list(&String::decode(&mut r)?),
-            AlgorithmKind::Mac,
-        ) {
-            Ok((_, m)) => m,
-            Err(e) => {
-                if need_mac {
-                    return Err(e);
-                } else {
-                    mac::NONE
+            };
+        let server_mac =
+            match Self::select(&pref.mac, &NameList::decode(&mut r)?, AlgorithmKind::Mac) {
+                Ok((_, m)) => m,
+                Err(e) => {
+                    if need_mac {
+                        return Err(e);
+                    } else {
+                        mac::NONE
+                    }
                 }
-            }
-        };
+            };
 
         // Compression
 
@@ -355,7 +344,7 @@ pub(crate) trait Select {
         let client_compression = compression::Compression::new(
             &Self::select(
                 &pref.compression,
-                &parse_kex_algo_list(&String::decode(&mut r)?),
+                &NameList::decode(&mut r)?,
                 AlgorithmKind::Compression,
             )?
             .1,
@@ -365,7 +354,7 @@ pub(crate) trait Select {
         let server_compression = compression::Compression::new(
             &Self::select(
                 &pref.compression,
-                &parse_kex_algo_list(&String::decode(&mut r)?),
+                &NameList::decode(&mut r)?,
                 AlgorithmKind::Compression,
             )?
             .1,
@@ -374,6 +363,8 @@ pub(crate) trait Select {
         String::decode(&mut r)?; // languages server-to-client
 
         let follows = u8::decode(&mut r)? != 0;
+        u32::decode(&mut r)?;
+        ensure_end(&r)?;
         Ok(Names {
             kex: kex_algorithm,
             key: key_algorithm,
@@ -397,15 +388,15 @@ impl Select for Server {
         true
     }
 
-    fn select<S: AsRef<str> + Clone>(
-        server_list: &[S],
-        client_list: &[&str],
+    fn select<A: AsRef<str> + Clone, B: AsRef<str> + Clone>(
+        server_list: &[A],
+        client_list: &[B],
         kind: AlgorithmKind,
-    ) -> Result<(bool, S), Error> {
+    ) -> Result<(bool, A), Error> {
         let mut both_first_choice = true;
         for c in client_list {
             for s in server_list {
-                if c == &s.as_ref() {
+                if c.as_ref() == s.as_ref() {
                     return Ok((both_first_choice, s.clone()));
                 }
                 both_first_choice = false
@@ -414,7 +405,7 @@ impl Select for Server {
         Err(Error::NoCommonAlgo {
             kind,
             ours: server_list.iter().map(|x| x.as_ref().to_owned()).collect(),
-            theirs: client_list.iter().map(|x| (*x).to_owned()).collect(),
+            theirs: client_list.iter().map(|x| x.as_ref().to_owned()).collect(),
         })
     }
 }
@@ -424,15 +415,15 @@ impl Select for Client {
         false
     }
 
-    fn select<S: AsRef<str> + Clone>(
-        client_list: &[S],
-        server_list: &[&str],
+    fn select<A: AsRef<str> + Clone, B: AsRef<str> + Clone>(
+        client_list: &[A],
+        server_list: &[B],
         kind: AlgorithmKind,
-    ) -> Result<(bool, S), Error> {
+    ) -> Result<(bool, A), Error> {
         let mut both_first_choice = true;
         for c in client_list {
             for s in server_list {
-                if s == &c.as_ref() {
+                if s.as_ref() == c.as_ref() {
                     return Ok((both_first_choice, c.clone()));
                 }
                 both_first_choice = false
@@ -441,7 +432,7 @@ impl Select for Client {
         Err(Error::NoCommonAlgo {
             kind,
             ours: client_list.iter().map(|x| x.as_ref().to_owned()).collect(),
-            theirs: server_list.iter().map(|x| (*x).to_owned()).collect(),
+            theirs: server_list.iter().map(|x| x.as_ref().to_owned()).collect(),
         })
     }
 }
@@ -450,13 +441,12 @@ pub(crate) fn write_kex(
     prefs: &Preferred,
     writer: &mut PacketWriter,
     server_config: Option<&Config>,
-) -> Result<CryptoVec, Error> {
-    writer.packet(|w| {
-        // buf.clear();
+) -> Result<Bytes, Error> {
+    writer.packet_bytes(|w| {
         msg::KEXINIT.encode(w)?;
 
         let mut cookie = [0; 16];
-        rand::thread_rng().fill_bytes(&mut cookie);
+        safe_rng().fill_bytes(&mut cookie);
         for b in cookie {
             b.encode(w)?;
         }
@@ -558,4 +548,82 @@ pub(crate) fn write_kex(
         0u32.encode(w)?; // reserved
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ssh_encoding::Encode;
+
+    use super::*;
+    use crate::helpers::NameList;
+
+    /// Build a minimal KEXINIT payload with a custom kex name-list and
+    /// `first_kex_packet_follows` flag. All other lists come from the default
+    /// preferences so negotiation succeeds.
+    fn build_kexinit(kex_names: &[&str], follows: bool) -> Vec<u8> {
+        let pref = Preferred::DEFAULT;
+        let mut buf = vec![msg::KEXINIT];
+        buf.extend_from_slice(&[0u8; 16]); // cookie
+        let names = |v: Vec<String>| NameList(v);
+        names(kex_names.iter().map(|s| s.to_string()).collect())
+            .encode(&mut buf)
+            .unwrap();
+        names(pref.key.iter().map(ToString::to_string).collect())
+            .encode(&mut buf)
+            .unwrap();
+        for _ in 0..2 {
+            names(pref.cipher.iter().map(|x| x.as_ref().to_string()).collect())
+                .encode(&mut buf)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            names(pref.mac.iter().map(|x| x.as_ref().to_string()).collect())
+                .encode(&mut buf)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            names(
+                pref.compression
+                    .iter()
+                    .map(|x| x.as_ref().to_string())
+                    .collect(),
+            )
+            .encode(&mut buf)
+            .unwrap();
+        }
+        Vec::<String>::new().encode(&mut buf).unwrap(); // lang c2s
+        Vec::<String>::new().encode(&mut buf).unwrap(); // lang s2c
+        (follows as u8).encode(&mut buf).unwrap();
+        0u32.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// Regression test for #733: a client that optimistically guesses a kex
+    /// algorithm russh does not implement (`sntrup761x25519-sha512`) — while
+    /// listing russh's own first choice (`mlkem768x25519-sha256`) second —
+    /// must have its guessed packet ignored, not consumed as the negotiated key.
+    #[test]
+    fn wrong_guess_for_unknown_kex_is_ignored() {
+        let buf = build_kexinit(
+            &[
+                "sntrup761x25519-sha512",
+                "mlkem768x25519-sha256",
+                "curve25519-sha256",
+            ],
+            true,
+        );
+        let names =
+            Server::read_kex(&buf, &Preferred::DEFAULT, None, &KexCause::Initial).unwrap();
+        assert_eq!(names.kex, kex::MLKEM768X25519_SHA256);
+        assert!(names.ignore_guessed, "wrong guess must be ignored");
+    }
+
+    /// A correct guess (client's first == server's first) must NOT be ignored.
+    #[test]
+    fn correct_guess_is_not_ignored() {
+        let buf = build_kexinit(&["mlkem768x25519-sha256", "curve25519-sha256"], true);
+        let names =
+            Server::read_kex(&buf, &Preferred::DEFAULT, None, &KexCause::Initial).unwrap();
+        assert!(!names.ignore_guessed, "correct guess must be honored");
+    }
 }

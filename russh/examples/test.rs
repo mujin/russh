@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use log::debug;
-use rand_core::OsRng;
 use russh::keys::*;
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::*;
@@ -12,9 +11,9 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut config = russh::server::Config::default();
     config.auth_rejection_time = std::time::Duration::from_secs(3);
-    config
-        .keys
-        .push(russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap());
+    config.keys.push(
+        russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap(),
+    );
     let config = Arc::new(config);
     let mut sh = Server {
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -52,14 +51,16 @@ impl server::Handler for Server {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         {
             debug!("channel open session");
             let mut clients = self.clients.lock().unwrap();
             clients.insert((self.id, channel.id()), channel);
         }
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     /// The client requests a shell.
@@ -90,7 +91,7 @@ impl server::Handler for Server {
         {
             let mut clients = self.clients.lock().unwrap();
             for ((_, _channel_id), ref mut channel) in clients.iter_mut() {
-                session.data(channel.id(), CryptoVec::from(data.to_vec()))?;
+                session.data(channel.id(), data.to_vec())?;
             }
         }
         Ok(())

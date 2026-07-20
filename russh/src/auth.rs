@@ -22,9 +22,9 @@ use ssh_key::{Certificate, HashAlg, PrivateKey};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::CryptoVec;
 use crate::helpers::NameList;
 use crate::keys::PrivateKeyWithHashAlg;
+use crate::keys::agent::AgentIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
@@ -100,7 +100,6 @@ impl From<&NameList> for MethodSet {
     fn from(value: &NameList) -> Self {
         Self(
             value
-                .0
                 .iter()
                 .filter_map(|x| MethodKind::from_str(x).ok())
                 .collect(),
@@ -157,12 +156,12 @@ impl AuthResult {
 pub trait Signer: Sized {
     type Error: From<crate::SendError>;
 
-    fn auth_publickey_sign(
+    fn auth_sign(
         &mut self,
-        key: &ssh_key::PublicKey,
+        key: &AgentIdentity,
         hash_alg: Option<HashAlg>,
-        to_sign: CryptoVec,
-    ) -> impl Future<Output = Result<CryptoVec, Self::Error>> + Send;
+        to_sign: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
 }
 
 #[derive(Debug, Error)]
@@ -174,18 +173,18 @@ pub enum AgentAuthError {
 }
 
 #[cfg_attr(feature = "async-trait", async_trait::async_trait)]
-impl<R: AsyncRead + AsyncWrite + Unpin + Send + 'static> Signer
+impl<R: AsyncRead + AsyncWrite + Unpin + Send> Signer
     for crate::keys::agent::client::AgentClient<R>
 {
     type Error = AgentAuthError;
 
     #[allow(clippy::manual_async_fn)]
-    fn auth_publickey_sign(
+    fn auth_sign(
         &mut self,
-        key: &ssh_key::PublicKey,
+        key: &AgentIdentity,
         hash_alg: Option<HashAlg>,
-        to_sign: CryptoVec,
-    ) -> impl Future<Output = Result<CryptoVec, Self::Error>> {
+        to_sign: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> {
         async move {
             self.sign_request(key, hash_alg, to_sign)
                 .await
@@ -216,6 +215,12 @@ pub enum Method {
         key: ssh_key::PublicKey,
         hash_alg: Option<HashAlg>,
     },
+    /// Certificate-based authentication using an external signer (e.g., SSH agent).
+    /// The certificate is sent to the server, but signing is delegated to the signer.
+    FutureCertificate {
+        cert: Certificate,
+        hash_alg: Option<HashAlg>,
+    },
     KeyboardInteractive {
         submethods: String,
     },
@@ -225,12 +230,21 @@ pub enum Method {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AuthRequest {
+    initial_methods: MethodSet,
     pub methods: MethodSet,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub partial_success: bool,
     pub current: Option<CurrentRequest>,
+    pub(crate) principal: Option<AuthPrincipal>,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub rejection_count: usize,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub(crate) struct AuthPrincipal {
+    user: String,
+    service: String,
 }
 
 #[doc(hidden)]
@@ -239,9 +253,9 @@ pub enum CurrentRequest {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     PublicKey {
         #[allow(dead_code)]
-        key: CryptoVec,
+        key: Vec<u8>,
         #[allow(dead_code)]
-        algo: CryptoVec,
+        algo: Vec<u8>,
         sent_pk_ok: bool,
     },
     KeyboardInteractive {
@@ -251,22 +265,53 @@ pub enum CurrentRequest {
 }
 
 impl AuthRequest {
+    pub(crate) fn server(methods: MethodSet) -> Self {
+        Self {
+            initial_methods: methods.clone(),
+            methods,
+            partial_success: false,
+            current: None,
+            principal: None,
+            rejection_count: 0,
+        }
+    }
+
     pub(crate) fn new(method: &Method) -> Self {
         match method {
             Method::KeyboardInteractive { submethods } => Self {
+                initial_methods: MethodSet::all(),
                 methods: MethodSet::all(),
                 partial_success: false,
                 current: Some(CurrentRequest::KeyboardInteractive {
                     submethods: submethods.to_string(),
                 }),
+                principal: None,
                 rejection_count: 0,
             },
             _ => Self {
+                initial_methods: MethodSet::all(),
                 methods: MethodSet::all(),
                 partial_success: false,
                 current: None,
+                principal: None,
                 rejection_count: 0,
             },
+        }
+    }
+
+    pub(crate) fn bind_or_reset_principal(&mut self, user: &str, service: &str) -> bool {
+        match &self.principal {
+            Some(bound) if bound.user == user && bound.service == service => false,
+            _ => {
+                self.principal = Some(AuthPrincipal {
+                    user: user.to_owned(),
+                    service: service.to_owned(),
+                });
+                self.methods = self.initial_methods.clone();
+                self.partial_success = false;
+                self.current = None;
+                true
+            }
         }
     }
 }

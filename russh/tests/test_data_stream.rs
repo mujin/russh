@@ -1,8 +1,6 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
-use rand::RngCore;
-use rand_core::OsRng;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelMsg, client};
@@ -71,7 +69,7 @@ impl ChannelDataCopy for ChannelHalves {
                     match msg {
                         ChannelMsg::WindowAdjusted { .. } => {}
                         ChannelMsg::Data { data } => buf.extend(&*data),
-                        ChannelMsg::Eof => break,
+                        ChannelMsg::Eof | ChannelMsg::Close => break,
                         msg => panic!("Got unexpected message: {msg:?}"),
                     }
                 }
@@ -119,7 +117,7 @@ async fn stream(
     mut test: impl ChannelDataCopy,
 ) -> Result<(), anyhow::Error> {
     let config = Arc::new(client::Config::default());
-    let key = Arc::new(PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap());
+    let key = Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
     let mut session = russh::client::connect(config, addr, Client).await?;
     let channel = match session
@@ -145,11 +143,9 @@ async fn stream(
 }
 
 fn data() -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-
     let mut data = vec![0u8; WINDOW_SIZE as usize * 2 + 7]; // Check whether the window_size resizing works
-    rng.fill_bytes(&mut data);
-
+    use rand::RngExt;
+    rand::rng().fill(&mut data[..]);
     data
 }
 
@@ -167,7 +163,7 @@ struct Server;
 impl Server {
     async fn run(addr: SocketAddr) {
         let config = Arc::new(server::Config {
-            keys: vec![PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap()],
+            keys: vec![PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap()],
             window_size: WINDOW_SIZE,
             ..Default::default()
         });
@@ -199,8 +195,10 @@ impl russh::server::Handler for Server {
     async fn channel_open_session(
         &mut self,
         mut channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
         tokio::spawn(async move {
             let (mut writer, mut reader) =
                 (channel.make_writer(), channel.make_reader_ext(Some(1)));
@@ -212,7 +210,7 @@ impl russh::server::Handler for Server {
             writer.shutdown().await.expect("Shutdown failed");
         });
 
-        Ok(true)
+        Ok(())
     }
 }
 

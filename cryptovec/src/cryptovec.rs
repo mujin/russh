@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut, Index, IndexMut, Range, RangeFrom, RangeFull, RangeTo};
 
-use crate::platform::{self, memset, mlock, munlock};
+use crate::platform::{mlock, munlock};
 
 /// A buffer which zeroes its memory on `.clear()`, `.resize()`, and
 /// reallocations, to avoid copying secrets around.
@@ -153,6 +153,57 @@ impl Default for CryptoVec {
     }
 }
 
+const MAX_CAPACITY: usize = 1usize << (usize::BITS - 2);
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::panic)]
+fn capacity_overflow(len: usize) -> ! {
+    panic!("CryptoVec capacity overflow: {len}")
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::panic)]
+fn length_overflow(lhs: usize, rhs: usize) -> ! {
+    panic!("CryptoVec length overflow: {lhs} + {rhs}")
+}
+
+#[cold]
+#[inline(never)]
+fn alloc_failed(layout: std::alloc::Layout) -> ! {
+    std::alloc::handle_alloc_error(layout)
+}
+
+#[inline]
+fn checked_capacity(len: usize) -> usize {
+    if len > MAX_CAPACITY {
+        capacity_overflow(len);
+    }
+    len.next_power_of_two()
+}
+
+#[inline]
+unsafe fn alloc_zeroed(capacity: usize) -> *mut u8 {
+    debug_assert!(capacity > 0);
+    let layout = unsafe { std::alloc::Layout::from_size_align_unchecked(capacity, 1) };
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    if p.is_null() {
+        alloc_failed(layout);
+    }
+    let _ = mlock(p, capacity);
+    p
+}
+
+#[inline]
+fn checked_len_sum(lhs: usize, rhs: usize) -> usize {
+    let sum = lhs.wrapping_add(rhs);
+    if sum < lhs {
+        length_overflow(lhs, rhs);
+    }
+    sum
+}
+
 impl CryptoVec {
     /// Creates a new `CryptoVec`.
     pub fn new() -> CryptoVec {
@@ -161,27 +212,27 @@ impl CryptoVec {
 
     /// Creates a new `CryptoVec` with `n` zeros.
     pub fn new_zeroed(size: usize) -> CryptoVec {
-        unsafe {
-            let capacity = size.next_power_of_two();
-            let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
-            let p = std::alloc::alloc_zeroed(layout);
-            let _ = mlock(p, capacity);
-            CryptoVec { p, capacity, size }
+        if size == 0 {
+            return CryptoVec::default();
         }
+
+        let capacity = checked_capacity(size);
+        let p = unsafe { alloc_zeroed(capacity) };
+        CryptoVec { p, capacity, size }
     }
 
     /// Creates a new `CryptoVec` with capacity `capacity`.
     pub fn with_capacity(capacity: usize) -> CryptoVec {
-        unsafe {
-            let capacity = capacity.next_power_of_two();
-            let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
-            let p = std::alloc::alloc_zeroed(layout);
-            let _ = mlock(p, capacity);
-            CryptoVec {
-                p,
-                capacity,
-                size: 0,
-            }
+        if capacity == 0 {
+            return CryptoVec::default();
+        }
+
+        let capacity = checked_capacity(capacity);
+        let p = unsafe { alloc_zeroed(capacity) };
+        CryptoVec {
+            p,
+            capacity,
+            size: 0,
         }
     }
 
@@ -208,42 +259,33 @@ impl CryptoVec {
     /// version with zeros.
     pub fn resize(&mut self, size: usize) {
         if size <= self.capacity && size > self.size {
-            // If this is an expansion, just resize.
+            // If this is an expansion within capacity, the memory is already zeroed.
             self.size = size
         } else if size <= self.size {
-            // If this is a truncation, resize and erase the extra memory.
+            // If this is a truncation, securely erase the extra memory.
+            // Uses zeroize (optimization_barrier) to prevent dead-store elimination.
             unsafe {
-                memset(self.p.add(size), 0, self.size - size);
+                zeroize(self.p.add(size), self.size - size);
             }
             self.size = size;
         } else {
             // realloc ! and erase the previous memory.
             unsafe {
-                let next_capacity = size.next_power_of_two();
+                let next_capacity = checked_capacity(size);
                 let old_ptr = self.p;
-                let next_layout = std::alloc::Layout::from_size_align_unchecked(next_capacity, 1);
-                self.p = std::alloc::alloc_zeroed(next_layout);
-                let _ = mlock(self.p, next_capacity);
+                let next_ptr = alloc_zeroed(next_capacity);
 
                 if self.capacity > 0 {
-                    std::ptr::copy_nonoverlapping(old_ptr, self.p, self.size);
-                    for i in 0..self.size {
-                        std::ptr::write_volatile(old_ptr.add(i), 0)
-                    }
+                    std::ptr::copy_nonoverlapping(old_ptr, next_ptr, self.size);
+                    zeroize(old_ptr, self.size);
                     let _ = munlock(old_ptr, self.capacity);
                     let layout = std::alloc::Layout::from_size_align_unchecked(self.capacity, 1);
                     std::alloc::dealloc(old_ptr, layout);
                 }
 
-                if self.p.is_null() {
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("Realloc failed, pointer = {self:?} {size:?}")
-                    }
-                } else {
-                    self.capacity = next_capacity;
-                    self.size = size;
-                }
+                self.p = next_ptr;
+                self.capacity = next_capacity;
+                self.size = size;
             }
         }
     }
@@ -263,7 +305,7 @@ impl CryptoVec {
     /// Append a new byte at the end of this CryptoVec.
     pub fn push(&mut self, s: u8) {
         let size = self.size;
-        self.resize(size + 1);
+        self.resize(checked_len_sum(size, 1));
         unsafe { *self.p.add(size) = s }
     }
 
@@ -275,7 +317,8 @@ impl CryptoVec {
         mut r: R,
     ) -> Result<usize, std::io::Error> {
         let cur_size = self.size;
-        self.resize(cur_size + n_bytes);
+        let target_size = checked_len_sum(cur_size, n_bytes);
+        self.resize(target_size);
         let s = unsafe { std::slice::from_raw_parts_mut(self.p.add(cur_size), n_bytes) };
         // Resize the buffer to its appropriate size.
         match r.read(s) {
@@ -320,7 +363,7 @@ impl CryptoVec {
     /// ```
     pub fn resize_mut(&mut self, n: usize) -> &mut [u8] {
         let size = self.size;
-        self.resize(size + n);
+        self.resize(checked_len_sum(size, n));
         unsafe { std::slice::from_raw_parts_mut(self.p.add(size), n) }
     }
 
@@ -332,7 +375,8 @@ impl CryptoVec {
     /// ```
     pub fn extend(&mut self, s: &[u8]) {
         let size = self.size;
-        self.resize(size + s.len());
+        let added = s.len();
+        self.resize(checked_len_sum(size, added));
         unsafe {
             std::ptr::copy_nonoverlapping(s.as_ptr(), self.p.add(size), s.len());
         }
@@ -366,10 +410,8 @@ impl Drop for CryptoVec {
     fn drop(&mut self) {
         if self.capacity > 0 {
             unsafe {
-                for i in 0..self.size {
-                    std::ptr::write_volatile(self.p.add(i), 0);
-                }
-                let _ = platform::munlock(self.p, self.capacity);
+                zeroize(self.p, self.size);
+                let _ = munlock(self.p, self.capacity);
                 let layout = std::alloc::Layout::from_size_align_unchecked(self.capacity, 1);
                 std::alloc::dealloc(self.p, layout);
             }
@@ -377,9 +419,71 @@ impl Drop for CryptoVec {
     }
 }
 
+unsafe fn zeroize(dst: *mut u8, size: usize) {
+    unsafe {
+        std::ptr::write_bytes(dst, 0, size);
+    }
+    optimization_barrier(dst, size);
+}
+
+// https://github.com/RustCrypto/utils/blob/a9f3f461baa3e02f69a205c772b6b2d3eac4eda8/zeroize/src/barrier.rs
+fn optimization_barrier(dst: *mut u8, size: usize) {
+    #[cfg(all(
+        not(miri),
+        any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "arm64ec",
+            target_arch = "loongarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "s390x",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        )
+    ))]
+    {
+        let _ = size;
+        unsafe {
+            core::arch::asm!(
+                "# {}",
+                in(reg) dst,
+                options(readonly, preserves_flags, nostack),
+            );
+        }
+    }
+    #[cfg(not(all(
+        not(miri),
+        any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "arm64ec",
+            target_arch = "loongarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "s390x",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        )
+    )))]
+    {
+        /// Custom version of `core::hint::black_box` implemented using
+        /// `#[inline(never)]` and `read_volatile`.
+        #[inline(never)]
+        fn custom_black_box(p: *const u8) {
+            let _ = unsafe { core::ptr::read_volatile(p) };
+        }
+
+        core::hint::black_box(dst);
+        if size > 0 {
+            custom_black_box(dst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::CryptoVec;
+    use super::{CryptoVec, checked_capacity};
 
     #[test]
     fn test_new() {
@@ -404,6 +508,14 @@ mod test {
         assert_eq!(crypto_vec.size, 5);
         // Ensure shrinking keeps the previous elements intact
         assert_eq!(crypto_vec.len(), 5);
+    }
+
+    #[test]
+    fn test_resize_zero() {
+        let mut crypto_vec = CryptoVec::new();
+        crypto_vec.resize(0);
+        assert_eq!(crypto_vec.size, 0);
+        assert_eq!(crypto_vec.len(), 0);
     }
 
     #[test]
@@ -503,10 +615,36 @@ mod test {
     }
 
     #[test]
+    fn test_with_capacity_zero() {
+        let crypto_vec = CryptoVec::with_capacity(0);
+        assert_eq!(crypto_vec.size, 0);
+        assert_eq!(crypto_vec.capacity, 0);
+    }
+
+    #[test]
+    fn test_new_zeroed_zero() {
+        let crypto_vec = CryptoVec::new_zeroed(0);
+        assert_eq!(crypto_vec.size, 0);
+        assert_eq!(crypto_vec.capacity, 0);
+    }
+
+    #[test]
     fn test_extend() {
         let mut crypto_vec = CryptoVec::new();
         crypto_vec.extend(b"test");
         assert_eq!(crypto_vec.as_ref(), b"test");
+    }
+
+    #[test]
+    #[should_panic(expected = "CryptoVec capacity overflow")]
+    fn test_checked_capacity_overflow_panics() {
+        let _ = checked_capacity(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "CryptoVec capacity overflow")]
+    fn test_checked_capacity_rejects_values_above_max_capacity() {
+        let _ = checked_capacity(super::MAX_CAPACITY + 1);
     }
 
     #[test]
