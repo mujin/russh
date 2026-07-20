@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rand_core::OsRng;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -36,7 +35,7 @@ impl TerminalHandle {
         let (sender, mut receiver) = unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
             while let Some(data) = receiver.recv().await {
-                let result = handle.data(channel_id, data.into()).await;
+                let result = handle.data(channel_id, data).await;
                 if result.is_err() {
                     eprintln!("Failed to send data: {result:?}");
                 }
@@ -122,7 +121,8 @@ impl AppServer {
             auth_rejection_time: std::time::Duration::from_secs(3),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
             keys: vec![
-                russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap(),
+                russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
+                    .unwrap(),
             ],
             nodelay: true,
             ..Default::default()
@@ -149,8 +149,9 @@ impl Handler for AppServer {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let terminal_handle = TerminalHandle::start(session.handle(), channel.id()).await;
 
         let backend = CrosstermBackend::new(terminal_handle);
@@ -165,7 +166,8 @@ impl Handler for AppServer {
         let mut clients = self.clients.lock().await;
         clients.insert(self.id, terminal);
 
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn auth_publickey(&mut self, _: &str, _: &PublicKey) -> Result<Auth, Self::Error> {

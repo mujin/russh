@@ -1,7 +1,7 @@
 # Russh
 
 [![Rust](https://github.com/warp-tech/russh/actions/workflows/rust.yml/badge.svg)](https://github.com/warp-tech/russh/actions/workflows/rust.yml)  <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-73-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-85-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 Low-level Tokio SSH2 client and server implementation.
@@ -115,6 +115,18 @@ This is a fork of [Thrussh](https://nest.pijul.com/pijul/thrussh) by Pierre-Éti
   * Uses `russh::server` for reverse forwarding connections, local forwarding tunnels, and the `ratatui` based admin interface.
 * [Motor OS](https://github.com/moturus/motor-os) -  A new Rust-based operating system for VMs.
   * Uses `russh::server` as the base for its own [SSH Server](https://github.com/moturus/motor-os/tree/main/src/bin/russhd). 
+* [Cubic VM](https://github.com/cubic-vm/cubic) - A lightweight command-line manager for virtual machines.
+  * Uses `russh::client` and `russh_sftp::client` to access the virtual machine instances.
+* [ferrissh](https://crates.io/crates/ferrissh) - An async SSH CLI scraper library for network device automation in Rust.
+  * Uses russh::client for SSH transport, authentication, and interactive PTY sessions.
+* [Yazi](https://github.com/sxyazi/yazi) - Blazing fast terminal file manager written in Rust, based on async I/O.
+  * Uses `russh::client` to implement an async SFTP provider for remote file management.
+* [GitArena](https://github.com/mellowagain/gitarena) - Software development platform with built-in vcs, issue tracking and code review.
+  * Uses `russh::server` to allow Git operations over SSH. 
+* [Calagopus](https://github.com/calagopus/wings) - Fast, Efficient and Scalable Game hosting - built for everyone.
+  * Uses `russh::server` for efficiently implementing SSH shells and SFTP file management.
+* [Oryxis](https://github.com/wilsonglasser/oryxis) - Rust-native SSH client with an encrypted vault, P2P sync and an embedded terminal.
+  * Uses `russh::client` for connections, jump hosts, SOCKS/HTTP/command proxies and SFTP.
 
 ## Contributors ✨
 
@@ -219,6 +231,22 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
       <td align="center" valign="top" width="14.28%"><a href="http://mbund.dev"><img src="https://avatars.githubusercontent.com/u/25110595?v=4?s=100" width="100px;" alt="Mark Bundschuh"/><br /><sub><b>Mark Bundschuh</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=mbund" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/tayu0110"><img src="https://avatars.githubusercontent.com/u/69729315?v=4?s=100" width="100px;" alt="tayu0110"/><br /><sub><b>tayu0110</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=tayu0110" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://cubic-vm.org"><img src="https://avatars.githubusercontent.com/u/155455820?v=4?s=100" width="100px;" alt="Roger Knecht"/><br /><sub><b>Roger Knecht</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=rogkne" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://gui.wf"><img src="https://avatars.githubusercontent.com/u/48162143?v=4?s=100" width="100px;" alt="Guilherme Fontes"/><br /><sub><b>Guilherme Fontes</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=gui-wf" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/zeroleo12345"><img src="https://avatars.githubusercontent.com/u/13072815?v=4?s=100" width="100px;" alt="Lyn"/><br /><sub><b>Lyn</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=zeroleo12345" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Mota-Link"><img src="https://avatars.githubusercontent.com/u/83714159?v=4?s=100" width="100px;" alt="Mota-Link"/><br /><sub><b>Mota-Link</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=Mota-Link" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mjc"><img src="https://avatars.githubusercontent.com/u/1977?v=4?s=100" width="100px;" alt="Mika Cohen"/><br /><sub><b>Mika Cohen</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=mjc" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://fbernier.me"><img src="https://avatars.githubusercontent.com/u/147585?v=4?s=100" width="100px;" alt="François Bernier"/><br /><sub><b>François Bernier</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=fbernier" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://vulns.xyz"><img src="https://avatars.githubusercontent.com/u/7763184?v=4?s=100" width="100px;" alt="kpcyrd"/><br /><sub><b>kpcyrd</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=kpcyrd" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/coreyleavitt"><img src="https://avatars.githubusercontent.com/u/18317330?v=4?s=100" width="100px;" alt="Corey Leavitt"/><br /><sub><b>Corey Leavitt</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=coreyleavitt" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/wi-adam"><img src="https://avatars.githubusercontent.com/u/127046659?v=4?s=100" width="100px;" alt="wi-adam"/><br /><sub><b>wi-adam</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=wi-adam" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://ddtkey.com"><img src="https://avatars.githubusercontent.com/u/26835520?v=4?s=100" width="100px;" alt="Artem Medvedev"/><br /><sub><b>Artem Medvedev</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=DDtKey" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ztbh"><img src="https://avatars.githubusercontent.com/u/67856492?v=4?s=100" width="100px;" alt="ztbh"/><br /><sub><b>ztbh</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=ztbh" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://blog.sakurapuare.com"><img src="https://avatars.githubusercontent.com/u/52142762?v=4?s=100" width="100px;" alt="Moder Steven"/><br /><sub><b>Moder Steven</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=SakuraPuare" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://jkshin.nubimaru.com"><img src="https://avatars.githubusercontent.com/u/949915?v=4?s=100" width="100px;" alt="Jeongkyu Shin"/><br /><sub><b>Jeongkyu Shin</b></sub></a><br /><a href="https://github.com/Eugeny/russh/commits?author=inureyes" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

@@ -16,8 +16,7 @@ async fn test_rekey_with_strict_kex() {
     let _ = env_logger::try_init();
 
     // Generate keys
-    let client_key =
-        PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
     // Server config with strict kex enabled
     let mut server_config = server::Config::default();
@@ -25,7 +24,7 @@ async fn test_rekey_with_strict_kex() {
     server_config.auth_rejection_time = std::time::Duration::from_secs(3);
     server_config
         .keys
-        .push(PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap());
+        .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
     // Enable strict kex by including the strict kex extension
     server_config.preferred = {
@@ -129,9 +128,11 @@ impl server::Handler for TestServer {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn data(
@@ -141,7 +142,7 @@ impl server::Handler for TestServer {
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         // Echo back the data
-        session.data(channel, CryptoVec::from_slice(data))?;
+        session.data(channel, data.to_vec())?;
         Ok(())
     }
 }

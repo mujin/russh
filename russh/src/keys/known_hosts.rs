@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::env;
 
 use data_encoding::BASE64_MIME;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use log::debug;
 use sha1::Sha1;
 
@@ -48,7 +49,7 @@ pub fn check_known_hosts_path<P: AsRef<Path>>(
 }
 
 fn known_hosts_path() -> Result<PathBuf, Error> {
-    home::home_dir()
+    env::home_dir()
         .map(|home_dir| home_dir.join(".ssh").join("known_hosts"))
         .ok_or(Error::NoHomeDir)
 }

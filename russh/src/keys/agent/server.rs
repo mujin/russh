@@ -19,6 +19,8 @@ use crate::keys::key::PrivateKeyWithHashAlg;
 use crate::keys::Error;
 use crate::CryptoVec;
 
+const MAX_AGENT_FRAME_LEN: usize = 256 * 1024;
+
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
 struct KeyStore(Arc<RwLock<HashMap<Vec<u8>, (Arc<PrivateKey>, SystemTime, Vec<Constraint>)>>>);
@@ -66,15 +68,13 @@ where
     let keys = KeyStore(Arc::new(RwLock::new(HashMap::new())));
     let lock = Lock(Arc::new(RwLock::new(CryptoVec::new())));
     while let Some(Ok(stream)) = listener.next().await {
-        let mut buf = CryptoVec::new();
-        buf.resize(4);
         russh_util::runtime::spawn(
             (Connection {
                 lock: lock.clone(),
                 keys: keys.clone(),
                 agent: Some(agent.clone()),
                 s: stream,
-                buf: CryptoVec::new(),
+                buf: Vec::new(),
             })
             .run(),
         );
@@ -93,24 +93,32 @@ struct Connection<S: AsyncRead + AsyncWrite + Send + 'static, A: Agent> {
     keys: KeyStore,
     agent: Option<A>,
     s: S,
-    buf: CryptoVec,
+    buf: Vec<u8>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync + 'static>
     Connection<S, A>
 {
+    async fn read_frame(&mut self) -> Result<(), Error> {
+        self.buf.clear();
+        self.buf.resize(4, 0);
+        self.s.read_exact(&mut self.buf).await?;
+
+        let len = BigEndian::read_u32(&self.buf) as usize;
+        if len > MAX_AGENT_FRAME_LEN {
+            return Err(Error::AgentProtocolError);
+        }
+
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        self.s.read_exact(&mut self.buf).await?;
+        Ok(())
+    }
+
     async fn run(mut self) -> Result<(), Error> {
-        let mut writebuf = CryptoVec::new();
+        let mut writebuf = Vec::new();
         loop {
-            // Reading the length
-            self.buf.clear();
-            self.buf.resize(4);
-            self.s.read_exact(&mut self.buf).await?;
-            // Reading the rest of the buffer
-            let len = BigEndian::read_u32(&self.buf) as usize;
-            self.buf.clear();
-            self.buf.resize(len);
-            self.s.read_exact(&mut self.buf).await?;
+            self.read_frame().await?;
             // respond
             writebuf.clear();
             self.respond(&mut writebuf).await?;
@@ -119,7 +127,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         }
     }
 
-    async fn respond(&mut self, writebuf: &mut CryptoVec) -> Result<(), Error> {
+    async fn respond(&mut self, writebuf: &mut Vec<u8>) -> Result<(), Error> {
         let is_locked = {
             if let Ok(password) = self.lock.0.read() {
                 !password.is_empty()
@@ -127,7 +135,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
                 true
             }
         };
-        writebuf.extend(&[0, 0, 0, 0]);
+        writebuf.extend_from_slice(&[0, 0, 0, 0]);
         let agentref = self.agent.as_ref().ok_or(Error::AgentFailure)?;
 
         match self.buf.split_first() {
@@ -156,7 +164,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
                 if signed {
                     return Ok(());
                 } else {
-                    writebuf.resize(4);
+                    writebuf.resize(4, 0);
                     writebuf.push(msg::FAILURE)
                 }
             }
@@ -263,7 +271,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         &self,
         r: &mut R,
         constrained: bool,
-        writebuf: &mut CryptoVec,
+        writebuf: &mut Vec<u8>,
     ) -> Result<bool, Error> {
         let (blob, key_pair) = {
             let private_key =
@@ -313,7 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         &self,
         agent: A,
         r: &mut R,
-        writebuf: &mut CryptoVec,
+        writebuf: &mut Vec<u8>,
     ) -> Result<(A, bool), Error> {
         let mut needs_confirm = false;
         let key = {
@@ -350,5 +358,46 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         BigEndian::write_u32(writebuf, (len - 4) as u32);
 
         Ok((agent, true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use byteorder::{BigEndian, ByteOrder};
+    use tokio::io::AsyncWriteExt;
+
+    use super::{Connection, KeyStore, Lock, MAX_AGENT_FRAME_LEN};
+    use crate::keys::Error;
+
+    #[test]
+    fn oversized_agent_request_is_rejected_before_allocation() -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(async {
+            let (server, mut client) = tokio::io::duplex(64);
+            let connection = Connection {
+                lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(crate::CryptoVec::new()))),
+                keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                ))),
+                agent: Some(()),
+                s: server,
+                buf: Vec::new(),
+            };
+            let server = tokio::spawn(async move { connection.run().await });
+
+            let mut frame = [0u8; 4];
+            BigEndian::write_u32(&mut frame, (MAX_AGENT_FRAME_LEN + 1) as u32);
+            client.write_all(&frame).await?;
+            drop(client);
+
+            let err = server.await.expect("server task").unwrap_err();
+            assert!(matches!(err, Error::AgentProtocolError));
+            Ok::<(), std::io::Error>(())
+        })?;
+
+        Ok(())
     }
 }
